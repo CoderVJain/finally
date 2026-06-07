@@ -66,7 +66,7 @@ The user runs a single Docker command (or a provided start script). A browser op
 - **Backend**: FastAPI (Python), managed as a `uv` project
 - **Database**: SQLite, single file at `db/finally.db`, volume-mounted for persistence
 - **Real-time data**: Server-Sent Events (SSE) — simpler than WebSockets, one-way server→client push, works everywhere
-- **AI integration**: LiteLLM → OpenRouter (Cerebras for fast inference), with structured outputs for trade execution
+- **AI integration**: LiteLLM → OpenRouter free model, with automatic fallback to the Groq llama model on failure; structured outputs for trade execution
 - **Market data**: Environment-variable driven — simulator by default, real data via Massive API if key provided
 
 ### Why These Choices
@@ -88,7 +88,7 @@ The user runs a single Docker command (or a provided start script). A browser op
 finally/
 ├── frontend/                 # Next.js TypeScript project (static export)
 ├── backend/                  # FastAPI uv project (Python)
-│   └── db/                   # Schema definitions, seed data, migration logic
+│   └── db/                   # Schema definitions, seed data, lazy init logic
 ├── planning/                 # Project-wide documentation for agents
 │   ├── PLAN.md               # This document
 │   └── ...                   # Additional agent reference docs
@@ -121,8 +121,11 @@ finally/
 ## 5. Environment Variables
 
 ```bash
-# Required: OpenRouter API key for LLM chat functionality
+# Required: OpenRouter API key for LLM chat (primary provider)
 OPENROUTER_API_KEY=your-openrouter-api-key-here
+
+# Required for fallback: Groq API key, used automatically if the OpenRouter call fails
+GROQ_API_KEY=your-groq-api-key-here
 
 # Optional: Massive (Polygon.io) API key for real market data
 # If not set, the built-in market simulator is used (recommended for most users)
@@ -134,6 +137,7 @@ LLM_MOCK=false
 
 ### Behavior
 
+- The LLM call uses the OpenRouter free model first; if that call fails, it falls back to the Groq llama model using `GROQ_API_KEY` (see Section 9)
 - If `MASSIVE_API_KEY` is set and non-empty → backend uses Massive REST API for market data
 - If `MASSIVE_API_KEY` is absent or empty → backend uses the built-in market simulator
 - If `LLM_MOCK=true` → backend returns deterministic mock LLM responses (for E2E tests)
@@ -153,7 +157,8 @@ Both the simulator and the Massive client implement the same abstract interface.
 - Updates at ~500ms intervals
 - Correlated moves across tickers (e.g., tech stocks move together)
 - Occasional random "events" — sudden 2-5% moves on a ticker for drama
-- Starts from realistic seed prices (e.g., AAPL ~$190, GOOGL ~$175, etc.)
+- Starts from realistic seed prices (e.g., AAPL ~$190, GOOGL ~$175, etc.); each ticker's seed price is also its "previous close" baseline used for % change
+- For a ticker added to the watchlist with no predefined seed, the simulator assigns a random realistic seed price (e.g., $50-$500) and uses it as both the starting price and previous close
 - Runs as an in-process background task — no external dependencies
 
 ### Massive API (Optional)
@@ -163,11 +168,15 @@ Both the simulator and the Massive client implement the same abstract interface.
 - Free tier (5 calls/min): poll every 15 seconds
 - Paid tiers: poll every 2-15 seconds depending on tier
 - Parses REST response into the same format as the simulator
+- Fetches each ticker's official previous close to use as the % change baseline (so changes match real-world quotes)
+- Validates a newly added ticker against the API; an unknown/invalid symbol is rejected (see `POST /api/watchlist`)
 
 ### Shared Price Cache
 
 - A single background task (simulator or Massive poller) writes to an in-memory price cache
-- The cache holds the latest price, previous price, and timestamp for each ticker
+- The cache holds the latest price, previous price, previous close (the % change baseline), and timestamp for each ticker
+- `% change = (latest price - previous close) / previous close`, used by the watchlist and positions table
+- The cache tracks the union of watchlist tickers and tickers with an open position. A ticker removed from the watchlist while still held stays in the cache so its position remains priced and visible
 - SSE streams read from this cache and push updates to connected clients
 - This architecture supports future multi-user scenarios without changes to the data layer
 
@@ -175,8 +184,8 @@ Both the simulator and the Massive client implement the same abstract interface.
 
 - Endpoint: `GET /api/stream/prices`
 - Long-lived SSE connection; client uses native `EventSource` API
-- Server pushes price updates for all tickers known to the system at a regular cadence (~500ms) — in the single-user model this is equivalent to the user's watchlist
-- Each SSE event contains ticker, price, previous price, timestamp, and change direction
+- Server pushes a snapshot for all tickers in the cache at a fixed ~500ms cadence, independent of the data source. When the source updates slowly (e.g., Massive free tier at 15s), the same cached value simply repeats until it changes
+- Each SSE event contains ticker, price, previous price, previous close, and timestamp. The client derives change direction itself as `sign(price - previous price)` and flashes green/red only when the value actually changes
 - Client handles reconnection automatically (EventSource has built-in retry)
 
 ---
@@ -267,10 +276,14 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 | POST | `/api/watchlist` | Add a ticker: `{ticker}` |
 | DELETE | `/api/watchlist/{ticker}` | Remove a ticker |
 
+- **Add behavior**: with Massive, the ticker is validated against the API and an unknown symbol returns `400`. With the simulator, any new symbol is accepted and assigned a random realistic seed price.
+- **Remove behavior**: removing a ticker you still hold a position in is allowed; the position stays priced and visible (the price cache keeps tracking held tickers — see Section 6).
+
 ### Chat
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/api/chat` | Send a message, receive complete JSON response (message + executed actions) |
+| GET | `/api/chat/history` | Past conversation messages, loaded when the page opens so history survives a refresh |
 
 ### System
 | Method | Path | Description |
@@ -281,9 +294,9 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 
 ## 9. LLM Integration
 
-When writing code to make calls to LLMs, use cerebras-inference skill to use LiteLLM via OpenRouter to the `openrouter/openai/gpt-oss-120b` model with Cerebras as the inference provider. Structured Outputs should be used to interpret the results.
+When writing code to make calls to LLMs, use LiteLLM. Call the `openrouter/openai/gpt-oss-120b:free` model via OpenRouter first; if that call fails (error or invalid response), fall back to the Groq `llama` model using `GROQ_API_KEY`. Structured Outputs should be used to interpret the results.
 
-There is an OPENROUTER_API_KEY in the .env file in the project root.
+There is an OPENROUTER_API_KEY and GROQ_API_KEY in the .env file in the project root.
 
 ### How It Works
 
@@ -292,11 +305,11 @@ When the user sends a chat message, the backend:
 1. Loads the user's current portfolio context (cash, positions with P&L, watchlist with live prices, total portfolio value)
 2. Loads recent conversation history from the `chat_messages` table
 3. Constructs a prompt with a system message, portfolio context, conversation history, and the user's new message
-4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras-inference skill
+4. Calls the LLM via LiteLLM (OpenRouter free model first, Groq llama on failure), requesting structured output
 5. Parses the complete structured JSON response
 6. Auto-executes any trades or watchlist changes specified in the response
 7. Stores the message and executed actions in `chat_messages`
-8. Returns the complete JSON response to the frontend (no token-by-token streaming — Cerebras inference is fast enough that a loading indicator is sufficient)
+8. Returns the complete JSON response to the frontend (no token-by-token streaming — inference is fast enough that a loading indicator is sufficient)
 
 ### Structured Output Schema
 
@@ -353,20 +366,21 @@ When `LLM_MOCK=true`, the backend returns deterministic mock responses instead o
 The frontend is a single-page application with a dense, terminal-inspired layout. The specific component architecture and layout system is up to the Frontend Engineer, but the UI should include these elements:
 
 - **Watchlist panel** — grid/table of watched tickers with: ticker symbol, current price (flashing green/red on change), daily change %, and a sparkline mini-chart (accumulated from SSE since page load)
-- **Main chart area** — larger chart for the currently selected ticker, with at minimum price over time. Clicking a ticker in the watchlist selects it here.
+- **Main chart area** — larger chart for the currently selected ticker, with at minimum price over time. Clicking a ticker in the watchlist selects it here. Like the sparklines, it draws from the SSE series accumulated since page load — there is no server-side price history or per-ticker history endpoint.
 - **Portfolio heatmap** — treemap visualization where each rectangle is a position, sized by portfolio weight, colored by P&L (green = profit, red = loss)
 - **P&L chart** — line chart showing total portfolio value over time, using data from `portfolio_snapshots`
 - **Positions table** — tabular view of all positions: ticker, quantity, avg cost, current price, unrealized P&L, % change
 - **Trade bar** — simple input area: ticker field, quantity field, buy button, sell button. Market orders, instant fill.
-- **AI chat panel** — docked/collapsible sidebar. Message input, scrolling conversation history, loading indicator while waiting for LLM response. Trade executions and watchlist changes shown inline as confirmations.
+- **AI chat panel** — docked/collapsible sidebar. Message input, scrolling conversation history (loaded from `GET /api/chat/history` on page open so it survives a refresh), loading indicator while waiting for LLM response. Trade executions and watchlist changes shown inline as confirmations.
 - **Header** — portfolio total value (updating live), connection status indicator, cash balance
 
 ### Technical Notes
 
 - Use `EventSource` for SSE connection to `/api/stream/prices`
+- Connection status dot derived from `EventSource` state: green when `onopen` fires (readyState OPEN), yellow on `onerror` while the browser is auto-retrying (readyState CONNECTING), red when readyState is CLOSED
 - Canvas-based charting library preferred (Lightweight Charts or Recharts) for performance
 - Price flash effect: on receiving a new price, briefly apply a CSS class with background color transition, then remove it
-- All API calls go to the same origin (`/api/*`) — no CORS configuration needed
+- All API calls go to the same origin (`/api/*`) — no CORS configuration needed in the production static export. In local dev, the Next.js dev server proxies `/api/*` to the backend via a rewrite, so no CORS config is needed there either
 - Tailwind CSS for styling with a custom dark theme
 
 ---
@@ -393,13 +407,13 @@ FastAPI serves the static frontend files and all API routes on port 8000.
 
 ### Docker Volume
 
-The SQLite database persists via a named Docker volume:
+The SQLite database persists via a bind mount of the project's `db/` directory:
 
 ```bash
-docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
+docker run -v "$(pwd)/db:/app/db" -p 8000:8000 --env-file .env finally
 ```
 
-The `db/` directory in the project root maps to `/app/db` in the container. The backend writes `finally.db` to this path.
+The `db/` directory in the project root maps to `/app/db` in the container. The backend writes `finally.db` to this path, so the database file is visible in the repo working tree (and gitignored). This matches the `db/` mount target described in Section 4.
 
 ### Start/Stop Scripts
 
@@ -454,3 +468,39 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Review — Resolution Log
+
+The documentation review items have been resolved and folded into the sections above. This log records each decision so the rationale isn't lost.
+
+### Must fix — contradictions and broken specs
+
+1. **LLM env vars / provider order.** `GROQ_API_KEY` added to Section 5 with behavior: the OpenRouter free model is called first and the Groq llama model is the automatic fallback on failure. Sections 3 and 9 reworded to match (cerebras references removed).
+
+2. **Docker volume vs. `db/` directory.** Standardized on a **bind mount** of the project `db/` directory (`-v "$(pwd)/db:/app/db"`) in Section 11, consistent with the `db/` mount target in Section 4.
+
+3. **"Migration logic" wording.** Section 4 now reads "lazy init logic"; there is no migration mechanism, only lazy create-if-missing (Section 7).
+
+4. **Chat history on reload.** Added `GET /api/chat/history` (Section 8); the chat panel loads it on page open (Section 10) so history survives a refresh.
+
+### Questions / clarifications
+
+5. **% change baseline (realistic).** The price cache now stores a **previous close** per ticker. Massive uses the official previous close; the simulator uses each ticker's seed price as its previous close. `% change = (latest - previous close) / previous close` (Section 6).
+
+6. **Main chart / sparkline data source.** Confirmed: both draw from the since-page-load SSE series; no server-side price history or history endpoint (Section 10).
+
+7. **Adding an unknown ticker.** Massive validates the symbol and returns `400` if invalid; the simulator accepts any symbol and assigns a random realistic seed price (Sections 6 and 8).
+
+8. **Removing a held ticker (realistic).** Allowed. The cache tracks the union of watchlist tickers + held tickers, so a removed-but-held position stays priced and visible (Sections 6 and 8).
+
+9. **SSE cadence when source is slow.** SSE pushes a snapshot at a fixed ~500ms cadence regardless of source; slow sources simply repeat the last cached value, and the client flashes only on actual change (Section 6).
+
+10. **Connection state derivation.** Green on `onopen` (OPEN), yellow on `onerror` while CONNECTING (auto-retry), red when CLOSED (Section 10).
+
+### Simplifications applied
+
+11. **Main chart reuses the SSE-accumulated series** — no extra endpoint or table (Section 10).
+
+12. **Change direction dropped from the SSE event** — the client derives `sign(price - previous)` (Section 6).
